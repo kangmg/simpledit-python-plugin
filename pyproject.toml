@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "simpledit-python-plugin"
+version = "0.1.0"
+description = "Python backend plugin for Simpledit"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+    { name = "kangmg", email = "kangmg@korea.ac.kr" },
+]
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "py2opsin",
+    "epic-mace",
+    "rdkit",
+]
+
+[project.scripts]
+simpledit-py = "simpledit_python_plugin.main:start"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/simpledit_python_plugin"]
