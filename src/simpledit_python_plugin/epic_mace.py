@@ -11,10 +11,6 @@ from simpledit_python_plugin.opsin import name_to_structure, OpsinRequest
 try:
     import mace
     from mace import Complex
-    # Note: The actual API of epic-mace needs to be verified. 
-    # Based on research, we might need to use specific functions.
-    # For now, we will implement a placeholder that simulates the behavior 
-    # or uses a generic structure if the library was available.
     MACE_AVAILABLE = True
 except ImportError as e:
     print(f"DEBUG: Failed to import mace: {e}")

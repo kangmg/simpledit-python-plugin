@@ -18,6 +18,8 @@ dependencies = [
     "py2opsin",
     "epic-mace",
     "rdkit",
+    "accfg>=0.0.7",
+    "toon-format>=0.9.0b1",
 ]
 
 [project.scripts]

@@ -9,6 +9,8 @@ Python backend extensions for Simpledit.
 ## Features
 
 - **Opsin Integration**: Convert IUPAC names to SMILES using `py2opsin`.
+- **Toon Format Conversion**: Convert SDF molecules to indexed SMILES with functional group analysis (AccFG & EFGs support).
+- **Epic-MACE Integration**: Generate 3D metal complexes.
 
 ## Installation
 
@@ -63,6 +65,66 @@ Convert an IUPAC name to a chemical structure (SMILES).
 
 **Notes:**
 - Returns an empty string `""` if the name is valid but yields no result (e.g. some trivial names).
+
+---
+
+### POST /api/python/toon-format
+
+Convert SDF format molecules to "toon format" with functional group analysis using either AccFG or EFGs method.
+
+**Request Body:**
+```json
+{
+  "sdf": "... SDF format string ...",
+  "selected_indices": [0, 1, 2],  // Optional, default: []
+  "method": "accfg"  // Optional, "accfg" or "efgs", default: "accfg"
+}
+```
+
+**Response:**
+```json
+{
+  "indexed_smiles": "[C:1]([C:2]([O:3][H:9])([H:7])[H:8])([H:4])([H:5])[H:6]",
+  "functional_groups": [
+    {
+      "name": "primary hydroxyl",
+      "smarts": null,
+      "atom_indices": [2],
+      "local_context": "FG atoms: O | Neighbors: C, H"
+    }
+  ],
+  "selected": [true, true, false, false, false, false, false, false, false],
+  "error": null
+}
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `sdf` | `string` | *required* | SDF format molecule string |
+| `selected_indices` | `List[int]` | `[]` | Indices of selected atoms (0-indexed) |
+| `method` | `string` | `"accfg"` | Functional group detection method: `"accfg"` or `"efgs"` |
+
+**Methods Comparison:**
+
+| Method | Description | Output Style | SMARTS Patterns |
+| :--- | :--- | :--- | :--- |
+| **accfg** | AccFG library - semantic, high-level functional groups | Natural language names (e.g., "primary hydroxyl", "carboxylic ester") | ❌ Not provided |
+| **efgs** | EFGs (Ertl) - algorithmic SMARTS-based detection | Generic chemical names (e.g., "Hydroxyl", "Carbonyl") | ✅ Provided |
+
+**Use Cases:**
+- **AccFG**: Best for high-level functional group classification, drug-like molecule analysis
+- **EFGs**: Best for detailed SMARTS-based analysis, comprehensive functional group detection
+
+**Notes:**
+- The `indexed_smiles` field contains SMILES with explicit hydrogens and atom mapping (1-indexed)
+- Atom indices in `atom_indices` are 0-indexed and include explicit hydrogens
+- The `selected` array is a boolean array matching the number of atoms (with explicit H)
+- `local_context` describes the functional group atoms and their immediate neighbors
+
+---
+
 ### POST /api/python/epic-mace/generate
 
 Generate a 3D metal complex using `epic-mace`.

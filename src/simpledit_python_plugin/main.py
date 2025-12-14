@@ -33,6 +33,12 @@ async def get_capabilities():
         modules.append("opsin")
     except ImportError:
         pass
+    
+    try:
+        import accfg
+        modules.append("toon-format")
+    except ImportError:
+        pass
 
     return {
         "python": True,
@@ -48,6 +54,17 @@ from simpledit_python_plugin.epic_mace import generate_complex, EpicMaceRequest,
 @app.post("/api/python/epic-mace/generate", response_model=EpicMaceResponse)
 async def run_epic_mace(request: EpicMaceRequest):
     return generate_complex(request)
+
+from simpledit_python_plugin.toon_format import convert_to_toon_format, ToonFormatRequest, ToonFormatResponse
+
+@app.post("/api/python/toon-format", response_model=ToonFormatResponse)
+async def run_toon_format(request: ToonFormatRequest):
+    """
+    Convert SDF format to toon format with functional group analysis.
+    Supports both 'accfg' and 'efgs' methods.
+    """
+    return convert_to_toon_format(request)
+
 
 def start():
     """Entry point for the CLI command 'simpledit-py'"""
