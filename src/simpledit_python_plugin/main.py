@@ -1,12 +1,13 @@
 import os
+import uuid
+from typing import Dict
+
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
-app = FastAPI(title="Simpledit Extra")
+app = FastAPI(title="Simpledit Python Plugin")
 
-# Enable CORS for development (allowing frontend to talk to backend)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,39 +16,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ---------------------------------------------------------------------------
+# Health + capabilities
+# ---------------------------------------------------------------------------
+
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "service": "simpledit-extra"}
+    return {"status": "ok", "service": "simpledit-python-plugin"}
 
-from simpledit_python_plugin.opsin import name_to_structure, OpsinRequest, OpsinResponse
 
 @app.get("/api/capabilities")
 async def get_capabilities():
-    """
-    Returns the list of available Python modules.
-    This helps the frontend decide which features to enable.
-    """
+    """List available modules so the frontend can enable features."""
     modules = []
-    try:
-        import py2opsin
-        modules.append("opsin")
-    except ImportError:
-        pass
-    
-    try:
-        import accfg
-        modules.append("toon-format")
-    except ImportError:
-        pass
+    for mod, name in [
+        ("py2opsin", "opsin"),
+        ("accfg",    "toon-format"),
+        ("xtb",      "xtb"),
+        ("mace",     "mace"),
+        ("sella",    "ts-optimize"),
+        ("asemcd",   "mcd"),
+    ]:
+        try:
+            __import__(mod)
+            modules.append(name)
+        except ImportError:
+            pass
+    return {"python": True, "modules": modules}
 
-    return {
-        "python": True,
-        "modules": modules
-    }
+
+# ---------------------------------------------------------------------------
+# Existing endpoints (opsin, epic-mace, toon-format)
+# ---------------------------------------------------------------------------
+
+from simpledit_python_plugin.opsin import name_to_structure, OpsinRequest, OpsinResponse
 
 @app.post("/api/python/opsin", response_model=OpsinResponse)
 async def run_opsin(request: OpsinRequest):
     return name_to_structure(request)
+
 
 from simpledit_python_plugin.epic_mace import generate_complex, EpicMaceRequest, EpicMaceResponse
 
@@ -55,26 +63,136 @@ from simpledit_python_plugin.epic_mace import generate_complex, EpicMaceRequest,
 async def run_epic_mace(request: EpicMaceRequest):
     return generate_complex(request)
 
+
 from simpledit_python_plugin.toon_format import convert_to_toon_format, ToonFormatRequest, ToonFormatResponse
 
 @app.post("/api/python/toon-format", response_model=ToonFormatResponse)
 async def run_toon_format(request: ToonFormatRequest):
-    """
-    Convert SDF format to toon format with functional group analysis.
-    Supports both 'accfg' and 'efgs' methods.
-    """
     return convert_to_toon_format(request)
 
 
-def start():
-    """Entry point for the CLI command 'simpledit-py'"""
-    import argparse
-    parser = argparse.ArgumentParser(description="Simpledit Python Backend")
-    parser.add_argument("--port", type=int, default=8000, help="Port to run the server on")
-    args = parser.parse_args()
+# ---------------------------------------------------------------------------
+# Calculation endpoints
+# ---------------------------------------------------------------------------
 
-    print(f"Starting Simpledit Python Backend on port {args.port}...")
-    uvicorn.run("simpledit_extra.main:app", host="127.0.0.1", port=args.port, reload=True)
+from simpledit_python_plugin.calculation_api import (
+    OptimizeRequest,    OptimizeResponse,    handle_optimize,
+    TSOptimizeRequest,  TSOptimizeResponse,  handle_ts_optimize,
+    NEBRequest,         NEBResponse,         handle_neb,
+    MCDRequest,         MCDResponse,         handle_mcd,
+    MCDConstraintsRequest, MCDConstraintsResponse, handle_mcd_constraints,
+    IRCRequest,         IRCResponse,         handle_irc,
+    FreqRequest,        FreqResponse,        handle_freq,
+    SinglePointRequest, SinglePointResponse, handle_single_point,
+)
+
+
+@app.post("/api/python/optimize", response_model=OptimizeResponse)
+async def optimize(request: OptimizeRequest):
+    """Geometry optimization (BFGS / LBFGS / FIRE)."""
+    return handle_optimize(request)
+
+
+@app.post("/api/python/ts-optimize", response_model=TSOptimizeResponse)
+async def ts_optimize(request: TSOptimizeRequest):
+    """Transition-state optimization with Sella."""
+    return handle_ts_optimize(request)
+
+
+@app.post("/api/python/neb", response_model=NEBResponse)
+async def neb(request: NEBRequest):
+    """NEB pathway search with IDPP interpolation."""
+    return handle_neb(request)
+
+
+@app.post("/api/python/mcd", response_model=MCDResponse)
+async def mcd(request: MCDRequest):
+    """Deform reactant toward product via Multi-Coordinate Driving."""
+    return handle_mcd(request)
+
+
+@app.post("/api/python/mcd/constraints", response_model=MCDConstraintsResponse)
+async def mcd_constraints(request: MCDConstraintsRequest):
+    """Auto-generate MCD constraints by comparing reactant and product bond graphs."""
+    return handle_mcd_constraints(request)
+
+
+@app.post("/api/python/irc", response_model=IRCResponse)
+async def irc(request: IRCRequest):
+    """IRC from a TS structure (forward + reverse, assembled as full path)."""
+    return handle_irc(request)
+
+
+@app.post("/api/python/frequency", response_model=FreqResponse)
+async def frequency(request: FreqRequest):
+    """Vibrational frequency analysis via finite differences."""
+    return handle_freq(request)
+
+
+@app.post("/api/python/single-point", response_model=SinglePointResponse)
+async def single_point(request: SinglePointRequest):
+    """Single-point energy + forces."""
+    return handle_single_point(request)
+
+
+# ---------------------------------------------------------------------------
+# SDF structure store
+#
+# Lightweight in-memory key-value store so the agent can deposit an SDF
+# (e.g. after a simpledit export) and later retrieve it by ID.
+# ---------------------------------------------------------------------------
+
+_structure_store: Dict[str, str] = {}
+
+
+@app.post("/api/structures/store")
+async def store_structure(body: dict):
+    """Store an SDF string, return a short ID.
+
+    Body: {"sdf": "<sdf_string>"}
+    """
+    sdf = body.get("sdf")
+    if not sdf:
+        raise HTTPException(status_code=422, detail="'sdf' field is required")
+    sid = uuid.uuid4().hex[:8]
+    _structure_store[sid] = sdf
+    return {"id": sid}
+
+
+@app.get("/api/structures/{structure_id}")
+async def get_structure(structure_id: str):
+    """Retrieve a stored SDF by ID."""
+    sdf = _structure_store.get(structure_id)
+    if sdf is None:
+        raise HTTPException(status_code=404, detail=f"Structure '{structure_id}' not found")
+    return {"id": structure_id, "sdf": sdf}
+
+
+@app.delete("/api/structures/{structure_id}")
+async def delete_structure(structure_id: str):
+    """Remove a stored SDF."""
+    if structure_id not in _structure_store:
+        raise HTTPException(status_code=404, detail=f"Structure '{structure_id}' not found")
+    _structure_store.pop(structure_id)
+    return {"deleted": structure_id}
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def start():
+    """CLI entry point: simpledit-py [--port PORT]"""
+    import argparse
+    parser = argparse.ArgumentParser(description="Simpledit Python Plugin")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args()
+    print(f"Starting Simpledit Python Plugin on port {args.port}...")
+    uvicorn.run(
+        "simpledit_python_plugin.main:app",
+        host="127.0.0.1", port=args.port, reload=True,
+    )
+
 
 if __name__ == "__main__":
     start()
