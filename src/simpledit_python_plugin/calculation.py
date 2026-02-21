@@ -4,11 +4,30 @@ Calculation module for ASE + MLIP based computational chemistry
 Architecture
 ------------
 Core functions take ASE Atoms directly and return typed dataclasses.
-Serialization (Atoms <-> SDF/XYZ/SMILES) lives in a separate section and
-is only used at the API boundary (FastAPI endpoints in main.py).
+Serialization (Atoms <-> SDF) lives in a separate section and is only
+used at the API boundary (FastAPI endpoints in main.py).
 
     Local use:  atoms → core_fn(atoms, attach_fn) → Result
-    API use:    payload → deserialize → core_fn → Result → serialize → response
+    API use:    sdf → atoms_from_sdf → core_fn → Result → atoms_to_sdf(template) → sdf
+
+SDF is the canonical I/O format because it preserves:
+  - Explicit bond orders and bond types
+  - 3D coordinates
+  - Fragment/disconnected-component information
+
+IMPORTANT — bond preservation after ASE computation
+----------------------------------------------------
+ASE Atoms objects carry only element symbols + positions; bond info is
+not stored internally.  After optimization / NEB / IRC the positions
+change, but the bond topology is unchanged.
+
+The correct round-trip is:
+  1.  sdf_to_mol_and_atoms(sdf)  → (rdkit_mol, atoms)   # bonds live in mol
+  2.  core_fn(atoms, ...)        → Result (new positions in Result.atoms)
+  3.  atoms_to_sdf(result.atoms, template_mol=rdkit_mol) # coords updated, bonds kept
+
+Never reconstruct bonds from geometry via DetermineBonds on a post-
+computation structure; bond inference can silently produce wrong topology.
 
 Supported calculations
 ----------------------
@@ -125,81 +144,159 @@ def make_attach_fn(calc_getter: Callable[[], Calculator]) -> AttachFn:
 
 # ---------------------------------------------------------------------------
 # Serialization utilities  (used only at the API boundary)
+#
+# SDF is the canonical format: it preserves bond orders, bond types, and
+# fragment topology across the computation round-trip.
+#
+# Recommended pattern
+# -------------------
+#   mol, atoms = sdf_to_mol_and_atoms(sdf)      # bonds stay in `mol`
+#   result     = geometry_optimize(atoms, ...)   # positions updated in-place
+#   out_sdf    = atoms_to_sdf(result.atoms, mol) # coords replaced, bonds kept
+#
+# For multi-fragment SDF (reactant + product in one file, salts, etc.)
+#   blocks = split_sdf(sdf)                      # split on "$$$$"
+#   mols_atoms = [sdf_to_mol_and_atoms(b) for b in blocks]
 # ---------------------------------------------------------------------------
 
-def atoms_from_xyz(xyz: str) -> Atoms:
-    """Parse XYZ string into ASE Atoms."""
-    return ase_read(StringIO(xyz), format="xyz")
-
-
-def atoms_to_xyz(atoms: Atoms) -> str:
-    """Serialize ASE Atoms to XYZ string."""
-    buf = StringIO()
-    ase_write(buf, atoms, format="xyz")
-    return buf.getvalue()
-
-
-def atoms_from_sdf(sdf: str) -> Atoms:
-    """Parse SDF/MOL block into ASE Atoms (via RDKit for bond info)."""
+def _mol_from_sdf(sdf: str):
+    """Return a sanitized RDKit Mol from an SDF block (with H atoms)."""
     from rdkit import Chem
 
     mol = Chem.MolFromMolBlock(sdf, removeHs=False, sanitize=True)
     if mol is None:
         raise ValueError("Failed to parse SDF block")
+    return mol
+
+
+def _mol_to_atoms(mol) -> Atoms:
+    """Extract element symbols + 3D positions from an RDKit Mol into ASE Atoms."""
     conf = mol.GetConformer()
     symbols = [a.GetSymbol() for a in mol.GetAtoms()]
     positions = [[*conf.GetAtomPosition(i)] for i in range(mol.GetNumAtoms())]
     return Atoms(symbols=symbols, positions=positions)
 
 
-def atoms_to_sdf(atoms: Atoms) -> str:
-    """Serialize ASE Atoms to SDF block (via RDKit)."""
-    from rdkit import Chem
-    from rdkit.Chem import AllChem
+# -- Primary entry points ----------------------------------------------------
 
-    xyz = atoms_to_xyz(atoms)
-    mol = Chem.MolFromXYZBlock(xyz)
+def sdf_to_mol_and_atoms(sdf: str):
+    """Parse a single SDF block, returning (rdkit_mol, ase_atoms).
+
+    The RDKit Mol retains the original bond topology and should be kept as a
+    template for ``atoms_to_sdf`` after computation so bonds are not lost.
+
+    Parameters
+    ----------
+    sdf:
+        A single MOL/SDF block (one molecule).
+
+    Returns
+    -------
+    mol : rdkit.Chem.Mol
+        Molecule with explicit bond information.  Use as ``template_mol`` in
+        ``atoms_to_sdf`` to preserve bonds after ASE computation.
+    atoms : ase.Atoms
+        Positions + elements only; suitable for ASE calculators.
+    """
+    mol = _mol_from_sdf(sdf)
+    return mol, _mol_to_atoms(mol)
+
+
+def atoms_from_sdf(sdf: str) -> Atoms:
+    """Parse a single SDF block into ASE Atoms (positions only).
+
+    Use ``sdf_to_mol_and_atoms`` instead when you need to write SDF back after
+    computation, to avoid bond-inference errors.
+    """
+    return _mol_to_atoms(_mol_from_sdf(sdf))
+
+
+def atoms_to_sdf(atoms: Atoms, template_mol=None) -> str:
+    """Serialize ASE Atoms back to an SDF block.
+
+    Parameters
+    ----------
+    atoms:
+        Structure with (possibly updated) positions.
+    template_mol:
+        The RDKit Mol returned by ``sdf_to_mol_and_atoms``.  When provided,
+        only the atomic coordinates are updated — bond orders, bond types, and
+        all other molecular properties are preserved from the original.
+
+        When *not* provided, bonds are inferred from geometry via
+        ``DetermineBonds``.  This is a lossy fallback; avoid it for
+        post-computation output where the original topology is available.
+    """
+    from rdkit import Chem
+
+    if template_mol is not None:
+        rw = Chem.RWMol(template_mol)
+        conf = rw.GetConformer()
+        for i, pos in enumerate(atoms.positions):
+            conf.SetAtomPosition(i, pos.tolist())
+        return Chem.MolToMolBlock(rw.GetMol())
+
+    # Fallback: infer bonds from geometry (use only when no template is available)
+    from rdkit.Chem import AllChem
+    from io import StringIO as _StringIO
+    buf = _StringIO()
+    ase_write(buf, atoms, format="xyz")
+    mol = Chem.MolFromXYZBlock(buf.getvalue())
     if mol is None:
         raise ValueError("Failed to convert Atoms to RDKit Mol")
     AllChem.DetermineBonds(mol)
     return Chem.MolToMolBlock(mol)
 
 
-def smiles_to_atoms(smiles: str, add_hydrogens: bool = True, seed: int = 42) -> Atoms:
-    """Convert a SMILES string to a 3D ASE Atoms object using RDKit ETKDG.
+# -- Multi-fragment helpers --------------------------------------------------
 
-    Parameters
-    ----------
-    smiles:
-        SMILES string.
-    add_hydrogens:
-        Whether to add explicit hydrogens before embedding.
-    seed:
-        Random seed for the conformer generator.
+def split_sdf(sdf: str) -> List[str]:
+    """Split a multi-molecule SDF into a list of individual SDF blocks.
+
+    SDF files use ``$$$$`` as a record separator.  This utility splits the
+    file while keeping the terminator line attached to each block, so each
+    returned string is a valid standalone SDF block.
+
+    Useful for reactant/product pairs, salt forms, or any input where the
+    caller packs multiple structures into one file.
     """
-    from rdkit import Chem
-    from rdkit.Chem import AllChem
-
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        raise ValueError(f"Invalid SMILES: {smiles!r}")
-    if add_hydrogens:
-        mol = Chem.AddHs(mol)
-    params = AllChem.ETKDGv3()
-    params.randomSeed = seed
-    result = AllChem.EmbedMolecule(mol, params)
-    if result == -1:
-        raise RuntimeError(f"RDKit could not generate a 3D conformer for: {smiles!r}")
-    AllChem.MMFFOptimizeMolecule(mol)
-    conf = mol.GetConformer()
-    symbols = [a.GetSymbol() for a in mol.GetAtoms()]
-    positions = [[*conf.GetAtomPosition(i)] for i in range(mol.GetNumAtoms())]
-    return Atoms(symbols=symbols, positions=positions)
+    blocks: List[str] = []
+    current: List[str] = []
+    for line in sdf.splitlines(keepends=True):
+        current.append(line)
+        if line.strip() == "$$$$":
+            block = "".join(current).strip()
+            if block:
+                blocks.append(block)
+            current = []
+    # Handle missing trailing separator
+    remainder = "".join(current).strip()
+    if remainder:
+        blocks.append(remainder)
+    return blocks
 
 
-def traj_to_xyz_list(images: List[Atoms]) -> List[str]:
-    """Serialize a list of Atoms to a list of XYZ strings."""
-    return [atoms_to_xyz(a) for a in images]
+def atoms_list_from_sdf(sdf: str) -> List[Atoms]:
+    """Parse a multi-molecule SDF into a list of ASE Atoms objects.
+
+    Equivalent to ``[atoms_from_sdf(b) for b in split_sdf(sdf)]``.
+    Use ``[sdf_to_mol_and_atoms(b) for b in split_sdf(sdf)]`` when bond
+    preservation is needed after computation.
+    """
+    return [atoms_from_sdf(block) for block in split_sdf(sdf)]
+
+
+def images_to_sdf(images: List[Atoms], template_mol=None) -> str:
+    """Serialize a trajectory / NEB path to a multi-molecule SDF.
+
+    Each frame becomes one SDF record, joined with ``$$$$`` separators.
+    If ``template_mol`` is given, bond topology is preserved for every frame.
+
+    Useful for exporting NEB images, IRC paths, or geometry optimization
+    trajectories as a single SDF file.
+    """
+    blocks = [atoms_to_sdf(img, template_mol) for img in images]
+    return "\n$$$$\n".join(blocks) + "\n$$$$\n"
 
 
 # ---------------------------------------------------------------------------
