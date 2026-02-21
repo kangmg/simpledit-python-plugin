@@ -8,26 +8,48 @@ Serialization (Atoms <-> SDF) lives in a separate section and is only
 used at the API boundary (FastAPI endpoints in main.py).
 
     Local use:  atoms → core_fn(atoms, attach_fn) → Result
-    API use:    sdf → atoms_from_sdf → core_fn → Result → atoms_to_sdf(template) → sdf
+    API use:    sdf → atoms_from_sdf → core_fn → Result → atoms_to_sdf → sdf
 
 SDF is the canonical I/O format because it preserves:
-  - Explicit bond orders and bond types
+  - Explicit bond orders and bond types (simpledit works with explicit bonds)
   - 3D coordinates
   - Fragment/disconnected-component information
 
-IMPORTANT — bond preservation after ASE computation
-----------------------------------------------------
-ASE Atoms objects carry only element symbols + positions; bond info is
-not stored internally.  After optimization / NEB / IRC the positions
-change, but the bond topology is unchanged.
+Bond preservation via atoms.info["connectivity"]
+-------------------------------------------------
+ASE Atoms objects carry only element symbols + positions; bond topology is
+not stored internally by ASE.  To bridge this gap, ``atoms_from_sdf``
+embeds the bond graph into ``atoms.info["connectivity"]`` as a list of
+``(begin_idx, end_idx, bond_order_float)`` tuples.
 
-The correct round-trip is:
-  1.  sdf_to_mol_and_atoms(sdf)  → (rdkit_mol, atoms)   # bonds live in mol
-  2.  core_fn(atoms, ...)        → Result (new positions in Result.atoms)
-  3.  atoms_to_sdf(result.atoms, template_mol=rdkit_mol) # coords updated, bonds kept
+Because ``atoms.info`` is preserved through ``atoms.copy()`` and most
+ASE operations, the bond info automatically travels with the structure
+through optimization / NEB / IRC without requiring a separate RDKit
+object to be kept in scope.
 
-Never reconstruct bonds from geometry via DetermineBonds on a post-
-computation structure; bond inference can silently produce wrong topology.
+``atoms_to_sdf`` reads back from ``atoms.info["connectivity"]`` to
+reconstruct the RDKit Mol with the original topology before serializing —
+never infers bonds from geometry.
+
+    atoms  = atoms_from_sdf(sdf)          # bond info in atoms.info
+    result = geometry_optimize(atoms, …)  # info preserved through copy
+    sdf    = atoms_to_sdf(result.atoms)   # exact original bonds restored
+
+Reaction modeling — reactant → product via MCD
+-----------------------------------------------
+Embedding reactant and product separately from SMILES is problematic for
+reaction modeling: random chain conformations introduce noise that
+interferes with NEB/IRC initial paths.
+
+The correct approach is:
+  1. Build the reactant structure (from SDF, geometry optimization, etc.)
+  2. Deform that structure into the product geometry via ``run_mcd``
+
+``run_mcd`` uses Multi-Coordinate Driving (asemcd2) to incrementally
+drive selected bond distances, angles, or dihedrals toward target values
+while relaxing all other degrees of freedom at each step.  The resulting
+endpoint is a product structure that shares the same conformational
+scaffold as the reactant — ideal as an NEB/DMF endpoint.
 
 Supported calculations
 ----------------------
@@ -37,6 +59,7 @@ Supported calculations
                            run_dmf            (DirectMaxFlux)
 - IRC                    : run_irc            (Sella IRC, forward + reverse)
 - Vibrational analysis   : freq_analysis      (ASE Vibrations)
+- MCD deformation        : run_mcd            (asemcd2, reactant → product)
 """
 
 from __future__ import annotations
@@ -117,6 +140,23 @@ class FreqResult:
     hessian: np.ndarray        # (3N, 3N) mass-weighted Hessian
 
 
+@dataclass
+class MCDResult:
+    """Result of a Multi-Coordinate Driving scan.
+
+    The pathway is ordered from the starting (reactant) geometry to the
+    endpoint reached after all constraints have been satisfied.  Bond
+    connectivity from the input Atoms is propagated to every frame so that
+    the full trajectory can be exported as a bond-preserving SDF.
+    """
+    pathway: List[Atoms]
+    energies: np.ndarray
+    ts_index: int       # index of the highest-energy frame in pathway
+    ts_atoms: Atoms     # frame at ts_index (TS guess)
+    forward_barrier: float   # eV, relative to pathway[0]
+    reverse_barrier: float   # eV, relative to pathway[-1]
+
+
 # ---------------------------------------------------------------------------
 # Calculator helpers
 # ---------------------------------------------------------------------------
@@ -145,105 +185,154 @@ def make_attach_fn(calc_getter: Callable[[], Calculator]) -> AttachFn:
 # ---------------------------------------------------------------------------
 # Serialization utilities  (used only at the API boundary)
 #
-# SDF is the canonical format: it preserves bond orders, bond types, and
-# fragment topology across the computation round-trip.
+# SDF is the canonical format: bond orders, bond types, and 3D coordinates
+# are all preserved.  Bond info is embedded into atoms.info["connectivity"]
+# so it travels with the Atoms object through ASE computations — no need to
+# carry a separate RDKit Mol object around.
 #
-# Recommended pattern
-# -------------------
-#   mol, atoms = sdf_to_mol_and_atoms(sdf)      # bonds stay in `mol`
-#   result     = geometry_optimize(atoms, ...)   # positions updated in-place
-#   out_sdf    = atoms_to_sdf(result.atoms, mol) # coords replaced, bonds kept
+# atoms.info["connectivity"] layout
+# ----------------------------------
+#   list of (begin_atom_idx, end_atom_idx, bond_order_float)
+#   bond_order_float: 1.0 = SINGLE, 1.5 = AROMATIC, 2.0 = DOUBLE, 3.0 = TRIPLE
+#
+# Recommended round-trip
+# ----------------------
+#   atoms  = atoms_from_sdf(sdf)          # bond info embedded in atoms.info
+#   result = geometry_optimize(atoms, …)  # atoms.info survives .copy() / ase ops
+#   sdf    = atoms_to_sdf(result.atoms)   # bonds reconstructed from atoms.info
 #
 # For multi-fragment SDF (reactant + product in one file, salts, etc.)
-#   blocks = split_sdf(sdf)                      # split on "$$$$"
-#   mols_atoms = [sdf_to_mol_and_atoms(b) for b in blocks]
+#   blocks = split_sdf(sdf)               # split on "$$$$"
+#   frames = [atoms_from_sdf(b) for b in blocks]
 # ---------------------------------------------------------------------------
 
-def _mol_from_sdf(sdf: str):
-    """Return a sanitized RDKit Mol from an SDF block (with H atoms)."""
+# Bond-order float → RDKit BondType mapping used in both directions
+_BOND_ORDER_TO_TYPE: dict = {}   # populated lazily to avoid rdkit import at module load
+_BOND_TYPE_TO_ORDER: dict = {}
+
+
+def _bond_type_maps():
+    """Return (order→type, type→order) dicts, importing rdkit once."""
+    if not _BOND_ORDER_TO_TYPE:
+        from rdkit.Chem import BondType
+        _BOND_ORDER_TO_TYPE.update({
+            1.0: BondType.SINGLE,
+            1.5: BondType.AROMATIC,
+            2.0: BondType.DOUBLE,
+            3.0: BondType.TRIPLE,
+        })
+        _BOND_TYPE_TO_ORDER.update({v: k for k, v in _BOND_ORDER_TO_TYPE.items()})
+    return _BOND_ORDER_TO_TYPE, _BOND_TYPE_TO_ORDER
+
+
+def atoms_from_sdf(sdf: str) -> Atoms:
+    """Parse a single SDF block into ASE Atoms.
+
+    Bond topology is embedded into ``atoms.info["connectivity"]`` as a list of
+    ``(begin_idx, end_idx, bond_order_float)`` tuples so it is preserved
+    through ASE copy/computation without requiring a separate RDKit object.
+    Formal charges are stored via ``atoms.set_initial_charges`` when non-zero.
+    """
     from rdkit import Chem
 
     mol = Chem.MolFromMolBlock(sdf, removeHs=False, sanitize=True)
     if mol is None:
         raise ValueError("Failed to parse SDF block")
-    return mol
 
+    _, type_to_order = _bond_type_maps()
 
-def _mol_to_atoms(mol) -> Atoms:
-    """Extract element symbols + 3D positions from an RDKit Mol into ASE Atoms."""
     conf = mol.GetConformer()
     symbols = [a.GetSymbol() for a in mol.GetAtoms()]
     positions = [[*conf.GetAtomPosition(i)] for i in range(mol.GetNumAtoms())]
-    return Atoms(symbols=symbols, positions=positions)
+    atoms = Atoms(symbols=symbols, positions=positions)
+
+    # Embed bond topology — survives atoms.copy() and slicing
+    atoms.info["connectivity"] = [
+        (b.GetBeginAtomIdx(), b.GetEndAtomIdx(),
+         type_to_order.get(b.GetBondType(), 1.0))
+        for b in mol.GetBonds()
+    ]
+
+    # Preserve formal charges when present
+    charges = [a.GetFormalCharge() for a in mol.GetAtoms()]
+    if any(c != 0 for c in charges):
+        atoms.set_initial_charges(charges)
+
+    return atoms
 
 
-# -- Primary entry points ----------------------------------------------------
+def _atoms_to_mol(atoms: Atoms):
+    """Rebuild an RDKit Mol from ASE Atoms using stored connectivity.
 
-def sdf_to_mol_and_atoms(sdf: str):
-    """Parse a single SDF block, returning (rdkit_mol, ase_atoms).
-
-    The RDKit Mol retains the original bond topology and should be kept as a
-    template for ``atoms_to_sdf`` after computation so bonds are not lost.
-
-    Parameters
-    ----------
-    sdf:
-        A single MOL/SDF block (one molecule).
-
-    Returns
-    -------
-    mol : rdkit.Chem.Mol
-        Molecule with explicit bond information.  Use as ``template_mol`` in
-        ``atoms_to_sdf`` to preserve bonds after ASE computation.
-    atoms : ase.Atoms
-        Positions + elements only; suitable for ASE calculators.
-    """
-    mol = _mol_from_sdf(sdf)
-    return mol, _mol_to_atoms(mol)
-
-
-def atoms_from_sdf(sdf: str) -> Atoms:
-    """Parse a single SDF block into ASE Atoms (positions only).
-
-    Use ``sdf_to_mol_and_atoms`` instead when you need to write SDF back after
-    computation, to avoid bond-inference errors.
-    """
-    return _mol_to_atoms(_mol_from_sdf(sdf))
-
-
-def atoms_to_sdf(atoms: Atoms, template_mol=None) -> str:
-    """Serialize ASE Atoms back to an SDF block.
-
-    Parameters
-    ----------
-    atoms:
-        Structure with (possibly updated) positions.
-    template_mol:
-        The RDKit Mol returned by ``sdf_to_mol_and_atoms``.  When provided,
-        only the atomic coordinates are updated — bond orders, bond types, and
-        all other molecular properties are preserved from the original.
-
-        When *not* provided, bonds are inferred from geometry via
-        ``DetermineBonds``.  This is a lossy fallback; avoid it for
-        post-computation output where the original topology is available.
+    Reads ``atoms.info["connectivity"]`` to reconstruct bond topology without
+    any geometry-based bond inference.  Raises ``KeyError`` if connectivity
+    has not been stored (i.e., the Atoms object did not originate from
+    ``atoms_from_sdf``).
     """
     from rdkit import Chem
 
-    if template_mol is not None:
-        rw = Chem.RWMol(template_mol)
-        conf = rw.GetConformer()
-        for i, pos in enumerate(atoms.positions):
-            conf.SetAtomPosition(i, pos.tolist())
-        return Chem.MolToMolBlock(rw.GetMol())
+    order_to_type, _ = _bond_type_maps()
+    connectivity = atoms.info["connectivity"]  # raises KeyError if absent
 
-    # Fallback: infer bonds from geometry (use only when no template is available)
+    rw = Chem.RWMol()
+    for symbol in atoms.get_chemical_symbols():
+        rw.AddAtom(Chem.Atom(symbol))
+
+    # Restore formal charges if stored
+    try:
+        charges = atoms.get_initial_charges()
+        for i, c in enumerate(charges):
+            if c != 0:
+                rw.GetAtomWithIdx(i).SetFormalCharge(int(round(c)))
+    except Exception:
+        pass
+
+    for begin, end, order in connectivity:
+        bond_type = order_to_type.get(float(order), Chem.BondType.SINGLE)
+        rw.AddBond(int(begin), int(end), bond_type)
+
+    conf = Chem.Conformer(len(atoms))
+    for i, pos in enumerate(atoms.positions):
+        conf.SetAtomPosition(i, pos.tolist())
+    rw.AddConformer(conf, assignId=True)
+
+    mol = rw.GetMol()
+    Chem.SanitizeMol(mol)
+    return mol
+
+
+def atoms_to_sdf(atoms: Atoms) -> str:
+    """Serialize ASE Atoms back to an SDF block.
+
+    Bond topology is read from ``atoms.info["connectivity"]`` (embedded by
+    ``atoms_from_sdf``), so the original bond orders are preserved even after
+    geometry optimization, NEB, or IRC.
+
+    Falls back to geometry-based bond inference (``DetermineBonds``) with a
+    warning when connectivity is not stored — this is lossy and should be
+    avoided for structures that originally came from SDF input.
+    """
+    from rdkit import Chem
+
+    if "connectivity" in atoms.info:
+        mol = _atoms_to_mol(atoms)
+        return Chem.MolToMolBlock(mol)
+
+    # Fallback: geometry-based bond inference (lossy — warns the caller)
+    import warnings
     from rdkit.Chem import AllChem
     from io import StringIO as _StringIO
+    warnings.warn(
+        "atoms_to_sdf: atoms.info['connectivity'] not found — falling back to "
+        "DetermineBonds, which may produce incorrect bond orders.  Prefer "
+        "atoms_from_sdf to parse input so bond info is preserved.",
+        stacklevel=2,
+    )
     buf = _StringIO()
     ase_write(buf, atoms, format="xyz")
     mol = Chem.MolFromXYZBlock(buf.getvalue())
     if mol is None:
-        raise ValueError("Failed to convert Atoms to RDKit Mol")
+        raise ValueError("Failed to convert Atoms to RDKit Mol via XYZ fallback")
     AllChem.DetermineBonds(mol)
     return Chem.MolToMolBlock(mol)
 
@@ -253,12 +342,10 @@ def atoms_to_sdf(atoms: Atoms, template_mol=None) -> str:
 def split_sdf(sdf: str) -> List[str]:
     """Split a multi-molecule SDF into a list of individual SDF blocks.
 
-    SDF files use ``$$$$`` as a record separator.  This utility splits the
-    file while keeping the terminator line attached to each block, so each
-    returned string is a valid standalone SDF block.
+    SDF files use ``$$$$`` as a record separator.  Each returned string is a
+    valid standalone SDF block with the terminator line included.
 
-    Useful for reactant/product pairs, salt forms, or any input where the
-    caller packs multiple structures into one file.
+    Useful for reactant/product pairs delivered as a single file.
     """
     blocks: List[str] = []
     current: List[str] = []
@@ -269,7 +356,6 @@ def split_sdf(sdf: str) -> List[str]:
             if block:
                 blocks.append(block)
             current = []
-    # Handle missing trailing separator
     remainder = "".join(current).strip()
     if remainder:
         blocks.append(remainder)
@@ -279,23 +365,20 @@ def split_sdf(sdf: str) -> List[str]:
 def atoms_list_from_sdf(sdf: str) -> List[Atoms]:
     """Parse a multi-molecule SDF into a list of ASE Atoms objects.
 
+    Each Atoms object carries bond info in ``atoms.info["connectivity"]``.
     Equivalent to ``[atoms_from_sdf(b) for b in split_sdf(sdf)]``.
-    Use ``[sdf_to_mol_and_atoms(b) for b in split_sdf(sdf)]`` when bond
-    preservation is needed after computation.
     """
     return [atoms_from_sdf(block) for block in split_sdf(sdf)]
 
 
-def images_to_sdf(images: List[Atoms], template_mol=None) -> str:
-    """Serialize a trajectory / NEB path to a multi-molecule SDF.
+def images_to_sdf(images: List[Atoms]) -> str:
+    """Serialize a trajectory / NEB / MCD path to a multi-molecule SDF.
 
-    Each frame becomes one SDF record, joined with ``$$$$`` separators.
-    If ``template_mol`` is given, bond topology is preserved for every frame.
-
-    Useful for exporting NEB images, IRC paths, or geometry optimization
-    trajectories as a single SDF file.
+    Each frame becomes one SDF record joined with ``$$$$`` separators.
+    Bond topology is read from each frame's ``atoms.info["connectivity"]``,
+    which is propagated automatically by ``run_mcd`` / ``run_neb`` etc.
     """
-    blocks = [atoms_to_sdf(img, template_mol) for img in images]
+    blocks = [atoms_to_sdf(img) for img in images]
     return "\n$$$$\n".join(blocks) + "\n$$$$\n"
 
 
@@ -629,4 +712,95 @@ def freq_analysis(
         frequencies=freqs_real.tolist(),
         n_imaginary=n_imag,
         hessian=hessian,
+    )
+
+
+def run_mcd(
+    atoms: Atoms,
+    constraints: dict,
+    attach: Optional[AttachFn] = None,
+    n_relax: int = 5,
+    fmax: float = 0.05,
+    optimizer: str = "BFGS",
+) -> MCDResult:
+    """Deform a reactant toward a product geometry via Multi-Coordinate Driving.
+
+    MCD drives selected internal coordinates (bonds, angles, dihedrals) toward
+    target values in small incremental steps, relaxing all other degrees of
+    freedom at each step.  This is the correct way to generate a product
+    structure from a reactant — it avoids the random-conformation noise that
+    arises from separately embedding each structure from SMILES.
+
+    The input ``atoms`` object should originate from ``atoms_from_sdf`` so
+    that ``atoms.info["connectivity"]`` is populated.  Bond info is propagated
+    to every frame in the returned pathway so the trajectory can be exported
+    as a bond-preserving SDF with ``images_to_sdf``.
+
+    Parameters
+    ----------
+    atoms:
+        Starting geometry (reactant).  Must have ``atoms.info["connectivity"]``
+        set (i.e. come from ``atoms_from_sdf``) for the output SDF to carry
+        correct bond orders.  Modified internally on a copy.
+    constraints:
+        Dict specifying which internal coordinates to drive and how far.
+        Key tuple length determines coordinate type:
+
+        - 2-tuple ``(i, j)``       → bond distance, target in Å
+        - 3-tuple ``(i, j, k)``    → valence angle, target in degrees
+        - 4-tuple ``(i, j, k, l)`` → dihedral angle, target in degrees
+
+        Value is ``(target_value, n_steps)``.
+
+        Example — SN2-like concerted bond change::
+
+            constraints = {
+                (0, 5): (4.0, 20),   # break bond 0-5, stretch to 4.0 Å in 20 steps
+                (2, 5): (1.5, 20),   # form bond 2-5, contract to 1.5 Å in 20 steps
+            }
+
+    attach:
+        AttachFn to set the calculator.  Used only if ``atoms.calc`` is None.
+    n_relax:
+        Number of geometry relaxation steps (perpendicular DOF) per MCD step.
+    fmax:
+        Force convergence criterion for the constrained relaxation (eV/Å).
+    optimizer:
+        ASE optimizer for the constrained relaxation: ``"BFGS"``, ``"FIRE"``,
+        or ``"LBFGS"``.
+
+    Returns
+    -------
+    MCDResult
+        Contains the full pathway (``List[Atoms]``), energy profile, TS guess
+        (highest-energy frame), and forward/reverse barriers.
+    """
+    from asemcd import MCD
+
+    working = atoms.copy()
+    _ensure_calc(working, attach)
+
+    mcd_obj = MCD(working, logfile=None)
+    raw = mcd_obj.scan(
+        constraints,
+        n_relax=n_relax,
+        fmax=fmax,
+        optimizer=optimizer,
+        save_trajectory=False,
+    )
+
+    # Propagate bond connectivity to every pathway frame so images_to_sdf works
+    connectivity = atoms.info.get("connectivity")
+    if connectivity is not None:
+        for frame in raw["pathway"]:
+            if "connectivity" not in frame.info:
+                frame.info["connectivity"] = connectivity
+
+    return MCDResult(
+        pathway=raw["pathway"],
+        energies=np.asarray(raw["energies"]),
+        ts_index=int(raw["ts_index"]),
+        ts_atoms=raw["ts_atoms"],
+        forward_barrier=float(raw["forward_barrier"]),
+        reverse_barrier=float(raw["reverse_barrier"]),
     )
