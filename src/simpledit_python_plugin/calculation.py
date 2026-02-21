@@ -57,6 +57,7 @@ Supported calculations
 - TS optimization        : ts_optimize        (Sella)
 - Double-ended search    : run_neb            (NEB + IDPP)
                            run_dmf            (DirectMaxFlux)
+                           run_popcornn       (NN continuous path, MLIP)
 - IRC                    : run_irc            (Sella IRC, forward + reverse)
 - Vibrational analysis   : freq_analysis      (ASE Vibrations)
 - MCD deformation        : run_mcd            (asemcd2, reactant → product)
@@ -138,6 +139,22 @@ class FreqResult:
     frequencies: List[float]   # cm⁻¹; imaginary freqs are negative
     n_imaginary: int
     hessian: np.ndarray        # (3N, 3N) mass-weighted Hessian
+
+
+@dataclass
+class PopcornnResult:
+    """Result of a Popcornn neural-network path optimization.
+
+    Uses a continuous NN path representation with MLIP potentials to find
+    optimal reaction pathways and transition states.  Multi-stage
+    optimization is supported: e.g. geodesic interpolation followed by
+    MLIP-based variational refinement.
+    """
+    images: List[Atoms]
+    ts_atoms: Atoms
+    energies: np.ndarray
+    forward_barrier: float   # eV, relative to images[0]
+    reverse_barrier: float   # eV, relative to images[-1]
 
 
 @dataclass
@@ -803,4 +820,141 @@ def run_mcd(
         ts_atoms=raw["ts_atoms"],
         forward_barrier=float(raw["forward_barrier"]),
         reverse_barrier=float(raw["reverse_barrier"]),
+    )
+
+
+def run_popcornn(
+    reactant: Atoms,
+    product: Atoms,
+    attach: Optional[AttachFn] = None,
+    potential: str = "mace",
+    model_name: str = "mace-mp-0",
+    n_embed: int = 1,
+    depth: int = 2,
+    num_record_points: int = 101,
+    optimization_stages: Optional[List[dict]] = None,
+    pre_optimize: bool = False,
+) -> PopcornnResult:
+    """Neural-network continuous path optimization using Popcornn.
+
+    Represents the reaction path as a continuous neural network function and
+    optimises it against MLIP potentials.  Supports multi-stage optimisation:
+    e.g. geodesic interpolation for initial de-clashing, then MLIP-based
+    variational reaction energy minimisation.
+
+    This is an alternative string method to NEB / DMF — useful for smooth
+    reaction paths and when NEB convergence is slow.
+
+    Parameters
+    ----------
+    reactant, product:
+        Endpoint structures.  Copied internally; originals not modified.
+    attach:
+        Optional AttachFn used only for endpoint pre-optimisation
+        (``pre_optimize=True``).  Popcornn manages its own MLIP
+        potentials internally.
+    potential:
+        MLIP potential name for the refinement stage.  Options include
+        ``'mace'``, ``'uma'``, ``'chgnet'``, ``'orb'``, etc.
+    model_name:
+        Model checkpoint name (e.g. ``'mace-mp-0'``, ``'uma-s-1'``).
+    n_embed:
+        NN path embedding dimensions.
+    depth:
+        MLP depth of the NN path representation.
+    num_record_points:
+        Number of discrete points sampled along the optimised continuous
+        path for the returned ``images`` list.
+    optimization_stages:
+        Explicit list of stage dicts for :meth:`Popcornn.optimize_path`.
+        Each dict should contain ``potential_params``, ``integrator_params``,
+        ``optimizer_params``, and ``num_optimizer_iterations``.
+        If ``None``, a sensible two-stage default is used (geodesic
+        interpolation → MLIP refinement).
+    pre_optimize:
+        If ``True`` and ``attach`` is given, pre-optimise endpoints with
+        ASE before running Popcornn.
+    """
+    from popcornn import Popcornn
+
+    r = reactant.copy()
+    p = product.copy()
+
+    if pre_optimize and attach is not None:
+        _pre_optimize_endpoints(r, p, attach)
+
+    # Transfer charge/spin info to endpoint images
+    charge = int(reactant.info.get("charge", 0))
+    spin = int(reactant.info.get("spin", 1))
+    for img in (r, p):
+        img.info["charge"] = charge
+        img.info["spin"] = spin
+
+    path = Popcornn(
+        images=[r, p],
+        path_params={"name": "mlp", "n_embed": n_embed, "depth": depth},
+        num_record_points=num_record_points,
+    )
+
+    if optimization_stages is None:
+        optimization_stages = [
+            {
+                "potential_params": {"potential": "repel"},
+                "integrator_params": {"path_ode_names": "geodesic"},
+                "optimizer_params": {"optimizer": {"name": "adam", "lr": 0.1}},
+                "num_optimizer_iterations": 1000,
+            },
+            {
+                "potential_params": {
+                    "potential": potential,
+                    "model_name": model_name,
+                },
+                "integrator_params": {
+                    "path_ode_names": "projected_variational_reaction_energy",
+                },
+                "optimizer_params": {"optimizer": {"name": "adam", "lr": 0.001}},
+                "num_optimizer_iterations": 1000,
+            },
+        ]
+
+    final_images, ts_image = path.optimize_path(*optimization_stages)
+    if not isinstance(final_images, list):
+        final_images = list(final_images)
+
+    # Extract energies — popcornn may store them in atoms.info or via calc
+    energies = []
+    for img in final_images:
+        if hasattr(img, "info") and "energy" in img.info:
+            energies.append(float(img.info["energy"]))
+        elif img.calc is not None:
+            try:
+                energies.append(float(img.get_potential_energy()))
+            except Exception:
+                energies.append(0.0)
+        else:
+            energies.append(0.0)
+    energies = np.asarray(energies)
+
+    if len(energies) > 0:
+        ts_e = float(energies.max())
+        forward_barrier = ts_e - float(energies[0])
+        reverse_barrier = ts_e - float(energies[-1])
+    else:
+        forward_barrier = 0.0
+        reverse_barrier = 0.0
+
+    # Propagate bond connectivity from reactant to all frames
+    connectivity = reactant.info.get("connectivity")
+    if connectivity is not None:
+        for img in final_images:
+            img.info.setdefault("connectivity", connectivity)
+        if hasattr(ts_image, "info"):
+            ts_image.info.setdefault("connectivity", connectivity)
+
+    return PopcornnResult(
+        images=final_images,
+        ts_atoms=ts_image,
+        energies=energies,
+        forward_barrier=forward_barrier,
+        reverse_barrier=reverse_barrier,
     )

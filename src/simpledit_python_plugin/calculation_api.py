@@ -408,3 +408,87 @@ def handle_single_point(req: SinglePointRequest) -> SinglePointResponse:
         )
     except Exception as exc:
         return SinglePointResponse(energy=0.0, error=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# 9. Popcornn (NN continuous path optimization)
+# ---------------------------------------------------------------------------
+
+class PopcornnOptStage(BaseModel):
+    """A single optimization stage for Popcornn multi-stage workflow."""
+    potential_params: dict = Field(..., description="e.g. {potential: 'mace', model_name: 'mace-mp-0'}")
+    integrator_params: dict = Field(default_factory=lambda: {"path_ode_names": "projected_variational_reaction_energy"})
+    optimizer_params: dict = Field(default_factory=lambda: {"optimizer": {"name": "adam", "lr": 0.001}})
+    num_optimizer_iterations: int = 1000
+
+
+class PopcornnRequest(BaseModel):
+    initial_sdf: str                     # reactant
+    final_sdf: str                       # product
+    potential: str = "mace"              # MLIP potential for default stages
+    model_name: str = "mace-mp-0"       # model checkpoint
+    calculator_params: CalculatorParams = Field(default_factory=CalculatorParams)
+    n_embed: int = 1
+    depth: int = 2
+    num_record_points: int = 101
+    optimization_stages: Optional[List[PopcornnOptStage]] = None
+    pre_optimize: bool = False
+    pre_optimize_calculator: str = "xtb"  # ASE calculator for pre-optimization
+
+
+class PopcornnResponse(BaseModel):
+    pathway_sdfs: List[str]
+    ts_sdf: str
+    energies: List[float]
+    forward_barrier: float
+    reverse_barrier: float
+    error: Optional[str] = None
+
+
+def handle_popcornn(req: PopcornnRequest) -> PopcornnResponse:
+    try:
+        from .calculation import atoms_from_sdf, atoms_to_sdf, run_popcornn
+
+        reactant = atoms_from_sdf(req.initial_sdf)
+        product = atoms_from_sdf(req.final_sdf)
+
+        attach = None
+        if req.pre_optimize:
+            attach = _make_attach(req.pre_optimize_calculator, req.calculator_params)
+
+        stages = None
+        if req.optimization_stages:
+            stages = [s.model_dump() for s in req.optimization_stages]
+
+        result = run_popcornn(
+            reactant, product,
+            attach=attach,
+            potential=req.potential,
+            model_name=req.model_name,
+            n_embed=req.n_embed,
+            depth=req.depth,
+            num_record_points=req.num_record_points,
+            optimization_stages=stages,
+            pre_optimize=req.pre_optimize,
+        )
+
+        # Propagate reactant bond connectivity
+        connectivity = reactant.info.get("connectivity")
+        if connectivity:
+            for img in result.images:
+                img.info.setdefault("connectivity", connectivity)
+            result.ts_atoms.info.setdefault("connectivity", connectivity)
+
+        return PopcornnResponse(
+            pathway_sdfs=[atoms_to_sdf(img) for img in result.images],
+            ts_sdf=atoms_to_sdf(result.ts_atoms),
+            energies=result.energies.tolist(),
+            forward_barrier=result.forward_barrier,
+            reverse_barrier=result.reverse_barrier,
+        )
+    except Exception as exc:
+        return PopcornnResponse(
+            pathway_sdfs=[], ts_sdf="",
+            energies=[], forward_barrier=0.0,
+            reverse_barrier=0.0, error=str(exc),
+        )

@@ -37,6 +37,8 @@ async def get_capabilities():
         ("mace",     "mace"),
         ("sella",    "ts-optimize"),
         ("asemcd",   "mcd"),
+        ("popcornn", "popcornn"),
+        ("dmf",      "dmf"),
     ]:
         try:
             __import__(mod)
@@ -84,6 +86,7 @@ from simpledit_python_plugin.calculation_api import (
     IRCRequest,         IRCResponse,         handle_irc,
     FreqRequest,        FreqResponse,        handle_freq,
     SinglePointRequest, SinglePointResponse, handle_single_point,
+    PopcornnRequest,    PopcornnResponse,    handle_popcornn,
 )
 
 
@@ -133,6 +136,12 @@ async def frequency(request: FreqRequest):
 async def single_point(request: SinglePointRequest):
     """Single-point energy + forces."""
     return handle_single_point(request)
+
+
+@app.post("/api/python/popcornn", response_model=PopcornnResponse)
+async def popcornn(request: PopcornnRequest):
+    """NN continuous path optimization (alternative string method to NEB/DMF)."""
+    return handle_popcornn(request)
 
 
 # ---------------------------------------------------------------------------
