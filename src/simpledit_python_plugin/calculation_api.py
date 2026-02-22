@@ -492,3 +492,69 @@ def handle_popcornn(req: PopcornnRequest) -> PopcornnResponse:
             energies=[], forward_barrier=0.0,
             reverse_barrier=0.0, error=str(exc),
         )
+
+
+# ---------------------------------------------------------------------------
+# 10. DMF (DirectMaxFlux TS pathway search)
+# ---------------------------------------------------------------------------
+
+class DMFRequest(BaseModel):
+    initial_sdf: str
+    final_sdf: str
+    calculator: str = "xtb"
+    calculator_params: CalculatorParams = Field(default_factory=CalculatorParams)
+    nmove: int = 20
+    update_teval: bool = True
+    convergence: str = "tight"   # "tight" | "normal" | "loose"
+    pre_optimize: bool = True
+
+
+class DMFResponse(BaseModel):
+    pathway_sdfs: List[str]
+    ts_sdf: str
+    energies: List[float]
+    forward_barrier: float
+    reverse_barrier: float
+    converged: bool
+    error: Optional[str] = None
+
+
+def handle_dmf(req: DMFRequest) -> DMFResponse:
+    try:
+        from .calculation import atoms_from_sdf, atoms_to_sdf, run_dmf
+
+        reactant = atoms_from_sdf(req.initial_sdf)
+        product  = atoms_from_sdf(req.final_sdf)
+        attach   = _make_attach(req.calculator, req.calculator_params)
+
+        result = run_dmf(
+            reactant, product, attach=attach,
+            nmove=req.nmove,
+            update_teval=req.update_teval,
+            convergence=req.convergence,
+            pre_optimize=req.pre_optimize,
+        )
+
+        # bond connectivity 전파
+        connectivity = reactant.info.get("connectivity")
+        if connectivity:
+            for img in result.images:
+                img.info.setdefault("connectivity", connectivity)
+
+        energies = [float(img.get_potential_energy()) for img in result.images]
+        ts_idx = int(max(range(len(energies)), key=lambda i: energies[i]))
+
+        return DMFResponse(
+            pathway_sdfs=[atoms_to_sdf(img) for img in result.images],
+            ts_sdf=atoms_to_sdf(result.images[ts_idx]),
+            energies=energies,
+            forward_barrier=energies[ts_idx] - energies[0],
+            reverse_barrier=energies[ts_idx] - energies[-1],
+            converged=True,
+        )
+    except Exception as exc:
+        return DMFResponse(
+            pathway_sdfs=[], ts_sdf="",
+            energies=[], forward_barrier=0.0,
+            reverse_barrier=0.0, converged=False, error=str(exc),
+        )

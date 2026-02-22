@@ -87,6 +87,7 @@ from simpledit_python_plugin.calculation_api import (
     FreqRequest,        FreqResponse,        handle_freq,
     SinglePointRequest, SinglePointResponse, handle_single_point,
     PopcornnRequest,    PopcornnResponse,    handle_popcornn,
+    DMFRequest,         DMFResponse,         handle_dmf,
 )
 
 
@@ -142,6 +143,36 @@ async def single_point(request: SinglePointRequest):
 async def popcornn(request: PopcornnRequest):
     """NN continuous path optimization (alternative string method to NEB/DMF)."""
     return handle_popcornn(request)
+
+
+@app.post("/api/python/dmf", response_model=DMFResponse)
+async def dmf(request: DMFRequest):
+    """DirectMaxFlux TS pathway search (alternative to NEB)."""
+    return handle_dmf(request)
+
+
+# ---------------------------------------------------------------------------
+# SMILES and reaction utilities
+# ---------------------------------------------------------------------------
+
+from simpledit_python_plugin.smiles_to_3d import (
+    SmilesTo3DRequest, SmilesTo3DResponse, smiles_to_3d
+)
+
+@app.post("/api/python/smiles-to-3d", response_model=SmilesTo3DResponse)
+async def convert_smiles_to_3d(request: SmilesTo3DRequest):
+    """Convert SMILES string to 3D SDF using RDKit ETKDG + MMFF."""
+    return smiles_to_3d(request)
+
+
+from simpledit_python_plugin.reaction_engine import (
+    ApplyReactionRequest, ApplyReactionResponse, apply_reaction
+)
+
+@app.post("/api/python/apply-reaction", response_model=ApplyReactionResponse)
+async def run_apply_reaction(request: ApplyReactionRequest):
+    """Apply reaction SMARTS to reactant SMILES, return product SMILES."""
+    return apply_reaction(request)
 
 
 # ---------------------------------------------------------------------------
