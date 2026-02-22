@@ -419,7 +419,7 @@ class PopcornnOptStage(BaseModel):
     potential_params: dict = Field(..., description="e.g. {potential: 'mace', model_name: 'mace-mp-0'}")
     integrator_params: dict = Field(default_factory=lambda: {"path_ode_names": "projected_variational_reaction_energy"})
     optimizer_params: dict = Field(default_factory=lambda: {"optimizer": {"name": "adam", "lr": 0.001}})
-    num_optimizer_iterations: int = 1000
+    num_optimizer_iterations: int = 50
 
 
 class PopcornnRequest(BaseModel):

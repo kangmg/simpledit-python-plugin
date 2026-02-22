@@ -902,7 +902,7 @@ def run_popcornn(
                 "potential_params": {"potential": "repel"},
                 "integrator_params": {"path_ode_names": "geodesic"},
                 "optimizer_params": {"optimizer": {"name": "adam", "lr": 0.1}},
-                "num_optimizer_iterations": 1000,
+                "num_optimizer_iterations": 50,
             },
             {
                 "potential_params": {
@@ -913,7 +913,7 @@ def run_popcornn(
                     "path_ode_names": "projected_variational_reaction_energy",
                 },
                 "optimizer_params": {"optimizer": {"name": "adam", "lr": 0.001}},
-                "num_optimizer_iterations": 1000,
+                "num_optimizer_iterations": 50,
             },
         ]
 
