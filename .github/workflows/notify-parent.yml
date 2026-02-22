@@ -1,0 +1,17 @@
+name: Notify parent repo to update submodule
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch submodule update to parent repo
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.PARENT_REPO_PAT }}
+          repository: kangmg/reaction_modeling_agent
+          event-type: submodule-updated
+          client-payload: '{"submodule": "simpledit-python-plugin", "sha": "${{ github.sha }}"}'
